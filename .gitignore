@@ -1,0 +1,8 @@
+*.tif
+*.png
+*.jpg
+*.npy
+*.pyc
+datasets/**/*
+datpytorch_i3d/asets/**/*
+*.txt
