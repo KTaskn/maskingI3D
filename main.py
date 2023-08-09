@@ -6,6 +6,7 @@ from torchvision import transforms
 from glob import glob
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 
 class FCL(nn.Module):
@@ -40,6 +41,13 @@ class MyModel(nn.Module):
         
         self.feature_backbone = InceptionI3d()
         
+        def __freeze(model):
+            for param in model.parameters():
+                param.requires_grad = False
+        __freeze(self.rgb_backbone)
+        __freeze(self.flow_backbone)
+        __freeze(self.feature_backbone)
+                
         # 22 x 22 x T
         self.fcl = FCL(484, 484, 484 * 16)
         
@@ -50,7 +58,16 @@ class MyModel(nn.Module):
         x_flow = _pooling_and_flatten(self.rgb_backbone.extract_features(flows))
         return x_rgb, x_flow
     
-    def forward(self, rgbs, flows=None, img_background=None):
+    def _masking(self, rgbs, mask, img_background):
+        # rgbs = N x C x T x H x W
+        # mask = N x T x H x W
+        # img_background = C x H x W
+        masked_rgb = rgbs * mask.unsqueeze(1)
+        masked_background = img_background.unsqueeze(0) * (1 - mask.unsqueeze(2).repeat(1, 1, 3, 1, 1))
+        return masked_rgb + masked_background.permute(0, 2, 1, 3, 4)
+        
+    
+    def forward(self, rgbs, flows, img_background):
         x_rgb, x_flow = self.forward_twostream(rgbs, flows)
         # N -> W x H 484 -> 22 x 22
         mask = self.fcl(x_rgb, x_flow)
@@ -60,13 +77,11 @@ class MyModel(nn.Module):
         # rgbs = N x C x T x H x W
         # mask = N x T x H x W
         # masking rgb
-        x_rgb = rgbs * mask.unsqueeze(1)
+        x_rgb = self._masking(rgbs, mask, img_background)
         feature = self.feature_backbone(x_rgb).squeeze(2)
         return feature
 
-if __name__ == "__main__":
-    model = MyModel()
-    l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test001/*.tif"))
+def open_images(l_path):    
     transform = transforms.Compose([
         transforms.Resize((224, 224)),
         transforms.ToTensor(),
@@ -75,6 +90,23 @@ if __name__ == "__main__":
     images = torch.stack([transform(Image.open(path).convert("RGB")) for path in l_path]).unsqueeze(0)
     # B x T x C x H x W -> B x C x T x H x W
     images = images.permute(0, 2, 1, 3, 4)
-    batch = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
-    print(batch.size())
-    print(model(batch, batch).size())
+    return images
+    
+
+if __name__ == "__main__":
+    model = MyModel()
+    l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test001/*.tif"))
+    l_mask_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test001/images/*.png"))
+    
+    images = open_images(l_path)
+    flows = open_images(l_mask_path)
+    print(images.size())
+    print(flows.size())
+    # # calculate background by median
+    # # B x C x T x H x W -> B x C x H x W
+    img_background = torch.median(images, dim=2).values.squeeze(0)
+    
+    batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
+    batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
+    print(batch_rgbs.size(), batch_flows.size())
+    print(model(batch_rgbs, batch_flows, img_background).size())
