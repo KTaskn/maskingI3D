@@ -30,12 +30,13 @@ class Loss(nn.Module):
 class FCL(nn.Module):
     def __init__(self, rgb_input_size, flow_input_size):        
         super().__init__()
+        print("rgb_input_size + flow_input_size:", rgb_input_size + flow_input_size)
         # FC Layer
         self.activation = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
-        self.layer1 = nn.Linear(rgb_input_size + flow_input_size, 256)
-        self.layer2 = nn.Linear(256, 128)
-        self.layer3 = nn.Linear(128, 1)
+        self.layer1 = nn.Linear(rgb_input_size + flow_input_size, 1024)
+        self.layer2 = nn.Linear(1024, 256)
+        self.layer3 = nn.Linear(256, 1)
 
         self.dropout1 = nn.Dropout(0.6)
         self.dropout2 = nn.Dropout(0.6)
@@ -77,7 +78,7 @@ class MyModel(nn.Module):
         feat_rgb, feat_flow = self.forward_twostream(torch.randn(BATCH, 3, 16, 224, 224), torch.randn(BATCH, 2, 16, 224, 224))
         self.fcl = FCL(feat_rgb.size(4), feat_flow.size(4))
         
-    def _fold_and_flatten(x):
+    def _fold_and_flatten(self, x):
         # TODO: これでいいのか？ -> 全体の数が減るぽい(はみ出る分を捨てる)
         # N x C x T x H x W => N x T x 4 x 4 x (C x H/4 x W/4)
         s = x.size(3) // 4
@@ -96,23 +97,27 @@ class MyModel(nn.Module):
         masked_rgb = rgbs * mask.unsqueeze(1)
         masked_background = img_background.unsqueeze(0) * (1 - mask.unsqueeze(2).repeat(1, 1, 3, 1, 1))
         return masked_rgb + masked_background.permute(0, 2, 1, 3, 4)
-        
+    
+    def _fold_mask(self, mask):        
+        mask = mask.squeeze(4).permute(3, 2, 0, 1)
+        mask = mask.unsqueeze(1)
+        mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
+        mask = mask.squeeze(1)
+        return mask
+    
     def get_mask(self, rgbs, flows):        
         feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)        
         # N x T x 4(h) x 4(w) x F
         mask = torch.stack([
             torch.stack([
                 torch.stack([
-                    self.fcl(feat_rgb[:, t, h, w], feat_flow[:, t, h, 2]) for t in range(feat_rgb.size(1))
+                    self.fcl(feat_rgb[:, t, h, w], feat_flow[:, t, h, w]) for t in range(feat_rgb.size(1))
                 ])            
                 for h in range(feat_rgb.size(2))
             ])
             for w in range(feat_rgb.size(3))
-        ]).squeeze(4).permute(3, 2, 1, 0)
-        mask = mask.unsqueeze(1)
-        mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
-        mask = mask.squeeze(1)
-        return mask
+        ])
+        return self._fold_mask(mask)
     
     def forward(self, rgbs, flows, img_background):
         mask = self.get_mask(rgbs, flows)
@@ -154,7 +159,7 @@ def open_flows(l_path):
     return flows
     
 EPOCH = 100000
-EVALUTATION_INTERVAL = 1000
+EVALUTATION_INTERVAL = 100
 def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     model = model.cuda() if cuda else model
     
@@ -189,7 +194,10 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
             total += feature0.size(0)
             running_loss = loss_sum / total
 
-            pbar.set_postfix({"loss": running_loss})
+            pbar.set_postfix({
+                "loss": running_loss,
+                "mask_var": masks.var().item(),
+            })
             pbar.update(1)
             
     model.eval()
@@ -206,7 +214,7 @@ ENDPOINTS = [
 if __name__ == "__main__":    
     # endpoint from command line
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", type=str, default="Conv3d_1a_7x7")
+    parser.add_argument("--endpoint", type=str, default="MaxPool3d_2a_3x3")
     args = parser.parse_args()
     endpoint = args.endpoint
     print("endpoint:", endpoint)
