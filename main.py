@@ -14,11 +14,11 @@ import argparse
 
 MASK_W = 4
 MASK_H = 4
-BATCH = 10
+BATCH = 5
 
 class Loss(nn.Module):
     # calculate distance between two features
-    def __init__(self, margin=0.2, alpha=10.0):
+    def __init__(self, margin=0.2, alpha=70.0):
         super().__init__()
         self.margin = margin
         self.alpha = alpha
@@ -37,7 +37,6 @@ class FCL(nn.Module):
         self.layer1 = nn.Linear(rgb_input_size + flow_input_size, 1024)
         self.layer2 = nn.Linear(1024, 256)
         self.layer3 = nn.Linear(256, 1)
-
         self.dropout1 = nn.Dropout(0.6)
         self.dropout2 = nn.Dropout(0.6)
 
@@ -159,7 +158,7 @@ def open_flows(l_path):
     return flows
     
 EPOCH = 10000
-EVALUTATION_INTERVAL = 100
+EVALUTATION_INTERVAL = 1000
 def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     model = model.cuda() if cuda else model
     
@@ -179,11 +178,11 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
                 model.eval()
                 with torch.no_grad():
                     masks = model.get_mask(batch_rgbs, batch_flows)
-                    yield model, masks
+                    yield num_step, model, masks
             model.train()
-            # idx = np.random.randint(0, batch_rgbs.size(0) - 2)
-            # feature0, feature1, masks = model(batch_rgbs[idx:idx+2], batch_flows[idx:idx+2], img_background)
-            feature0, feature1, masks = model(batch_rgbs, batch_flows, img_background)
+            idx = np.random.randint(0, batch_rgbs.size(0) - BATCH)
+            feature0, feature1, masks = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
+            # feature0, feature1, masks = model(batch_rgbs, batch_flows, img_background)
                     
             loss = criterion(feature0, feature1, masks)
         
@@ -204,7 +203,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     model.eval()
     with torch.no_grad():
         masks = model.get_mask(batch_rgbs, batch_flows)
-        yield model, masks
+        yield num_step, model, masks
     
 ENDPOINTS = [
         'Conv3d_1a_7x7',
@@ -227,14 +226,17 @@ if __name__ == "__main__":
     images_without_normalize, img_background_without_normalize = open_images_with_background(l_path, False)
     flows = open_flows(l_flow_path)
     
-    batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
-    batch_images_without_normalize = torch.vstack([images_without_normalize[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
-    batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
+    batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(images.size(2) // 16)])
+    batch_images_without_normalize = torch.vstack([
+        images_without_normalize[:, :, seq * 16:seq * 16 + 16]
+        for seq in range(images.size(2) // 16)])
+    batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(images.size(2) // 16)])
     print("size: ", batch_rgbs.size(), batch_flows.size())
     
     model = MyModel(endpoint=endpoint)
-    for model, masks in train(model, batch_rgbs, batch_flows, img_background):
+    for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background):
         model.eval()
+        torch.save(model.state_dict(), f"./masked/{endpoint}/model{num_step:08}.pt")
         with torch.no_grad():
             model = model.cuda()
             masks = masks.cuda()
@@ -244,14 +246,14 @@ if __name__ == "__main__":
                 batch_images_without_normalize,
                 masks,
                 img_background_without_normalize
-            ).cpu().permute(0, 2, 1, 3, 4).contiguous()[-1:].view(-1, 3, 224, 224).numpy()
+            ).cpu().permute(0, 2, 1, 3, 4).contiguous()[:].view(-1, 3, 224, 224).numpy()
             masked1 = model._masking(
                 batch_images_without_normalize,
                 1 - masks,
                 img_background_without_normalize
-            ).cpu().permute(0, 2, 1, 3, 4).contiguous()[-1:].view(-1, 3, 224, 224).numpy()
+            ).cpu().permute(0, 2, 1, 3, 4).contiguous()[:].view(-1, 3, 224, 224).numpy()
             # save images
-            masks = masks[-1:].cpu().contiguous().view(-1, 224, 224).numpy()
+            masks = masks[:].cpu().contiguous().view(-1, 224, 224).numpy()
             for i, mask in enumerate(masks):
                 Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{endpoint}/masked{i:02}-mask.png")
                 
