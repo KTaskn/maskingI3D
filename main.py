@@ -14,7 +14,7 @@ import argparse
 
 MASK_W = 4
 MASK_H = 4
-BATCH = 5
+BATCH = 10
 
 class Loss(nn.Module):
     # calculate distance between two features
@@ -47,25 +47,22 @@ class FCL(nn.Module):
         x = self.dropout2(self.activation(self.layer2(x)))
         return self.sigmoid(self.layer3(x))
     
-PATH_TRAINED_MODEL_RGB = "./pytorch_i3d/models/rgb_charades.pt"
-PATH_TRAINED_MODEL_FLOW = "./pytorch_i3d/models/flow_charades.pt"
+PATH_TRAINED_MODEL_RGB = "./pytorch_i3d/models/rgb_imagenet.pt"
+PATH_TRAINED_MODEL_FLOW = "./pytorch_i3d/models/flow_imagenet.pt"
 class MyModel(nn.Module):
     def __init__(self, endpoint="MaxPool3d_2a_3x3"):
         super(MyModel, self).__init__()  
-        self.rgb_backbone = InceptionI3d(400, in_channels=3)
-        self.rgb_backbone.replace_logits(157)
+        self.rgb_backbone = InceptionI3d(in_channels=3)
         self.rgb_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_RGB))
         self.rgb_backbone._final_endpoint = endpoint
         self.rgb_backbone.build()
         
-        self.flow_backbone = InceptionI3d(400, in_channels=2)
-        self.flow_backbone.replace_logits(157)
+        self.flow_backbone = InceptionI3d(in_channels=2)
         self.flow_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_FLOW))
         self.flow_backbone._final_endpoint = endpoint
         self.flow_backbone.build()
         
-        self.feature_backbone = InceptionI3d(400, in_channels=3)
-        self.feature_backbone.replace_logits(157)
+        self.feature_backbone = InceptionI3d(in_channels=3)
         self.feature_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_RGB))
         
         def __freeze(model):
@@ -98,24 +95,27 @@ class MyModel(nn.Module):
         masked_background = img_background.unsqueeze(0) * (1 - mask.unsqueeze(2).repeat(1, 1, 3, 1, 1))
         return masked_rgb + masked_background.permute(0, 2, 1, 3, 4)
     
-    def _fold_mask(self, mask):        
+    def _fold_mask(self, mask):
+        # mask = H x W x T x 10 x 1
         mask = mask.squeeze(4).permute(3, 2, 0, 1)
         mask = mask.unsqueeze(1)
         mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
         mask = mask.squeeze(1)
+        # ret = N x T x H x W
         return mask
     
     def get_mask(self, rgbs, flows):        
         feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)        
         # N x T x 4(h) x 4(w) x F
+        # mask = H x W x T x 10 x 1
         mask = torch.stack([
             torch.stack([
                 torch.stack([
                     self.fcl(feat_rgb[:, t, h, w], feat_flow[:, t, h, w]) for t in range(feat_rgb.size(1))
                 ])            
-                for h in range(feat_rgb.size(2))
+                for w in range(feat_rgb.size(3))
             ])
-            for w in range(feat_rgb.size(3))
+            for h in range(feat_rgb.size(2))
         ])
         return self._fold_mask(mask)
     
@@ -158,7 +158,7 @@ def open_flows(l_path):
     flows = flows.unsqueeze(0)
     return flows
     
-EPOCH = 100000
+EPOCH = 10000
 EVALUTATION_INTERVAL = 100
 def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     model = model.cuda() if cuda else model
@@ -181,8 +181,9 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
                     masks = model.get_mask(batch_rgbs, batch_flows)
                     yield model, masks
             model.train()
-            idx = np.random.randint(0, batch_rgbs.size(0) - 2)
-            feature0, feature1, masks = model(batch_rgbs[idx:idx+2], batch_flows[idx:idx+2], img_background)
+            # idx = np.random.randint(0, batch_rgbs.size(0) - 2)
+            # feature0, feature1, masks = model(batch_rgbs[idx:idx+2], batch_flows[idx:idx+2], img_background)
+            feature0, feature1, masks = model(batch_rgbs, batch_flows, img_background)
                     
             loss = criterion(feature0, feature1, masks)
         
@@ -195,8 +196,8 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
             running_loss = loss_sum / total
 
             pbar.set_postfix({
-                "loss": running_loss,
-                "mask_var": masks.var().item(),
+                "exp(-mask_var)": torch.exp(-masks.var()).item(),
+                "running_loss": running_loss,
             })
             pbar.update(1)
             
@@ -220,11 +221,11 @@ if __name__ == "__main__":
     print("endpoint:", endpoint)
     
     l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
-    l_mask_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/*.npy"))
+    l_flow_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/*.npy"))
     
     images, img_background = open_images_with_background(l_path, True)
     images_without_normalize, img_background_without_normalize = open_images_with_background(l_path, False)
-    flows = open_flows(l_mask_path)
+    flows = open_flows(l_flow_path)
     
     batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
     batch_images_without_normalize = torch.vstack([images_without_normalize[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
