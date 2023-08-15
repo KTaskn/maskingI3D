@@ -77,14 +77,16 @@ class MyModel(nn.Module):
         feat_rgb, feat_flow = self.forward_twostream(torch.randn(BATCH, 3, 16, 224, 224), torch.randn(BATCH, 2, 16, 224, 224))
         self.fcl = FCL(feat_rgb.size(4), feat_flow.size(4))
         
+    def _fold_and_flatten(x):
+        # TODO: これでいいのか？ -> 全体の数が減るぽい(はみ出る分を捨てる)
+        # N x C x T x H x W => N x T x 4 x 4 x (C x H/4 x W/4)
+        s = x.size(3) // 4
+        return x.unfold(3, s, s).unfold(4, s, s).permute(0, 2, 3, 4, 1, 5, 6).flatten(4)
+    
     def forward_twostream(self, rgbs, flows):
-        def _fold_and_flatten(x):
-            # TODO: これでいいのか？
-            # N x C x T x H x W => N x T x 4 x 4 x (C x H/4 x W/4)
-            s = x.size(3) // 4
-            return x.unfold(3, s, s).unfold(4, s, s).permute(0, 2, 3, 4, 1, 5, 6).flatten(4)
-        x_rgb = _fold_and_flatten(self.rgb_backbone.extract_features(rgbs))
-        x_flow = _fold_and_flatten(self.flow_backbone.extract_features(flows))
+        # N x T x 4(h) x 4(w) x F
+        x_rgb = self._fold_and_flatten(self.rgb_backbone.extract_features(rgbs))
+        x_flow = self._fold_and_flatten(self.flow_backbone.extract_features(flows))
         return x_rgb, x_flow
     
     def _masking(self, rgbs, mask, img_background):
@@ -96,16 +98,16 @@ class MyModel(nn.Module):
         return masked_rgb + masked_background.permute(0, 2, 1, 3, 4)
         
     def get_mask(self, rgbs, flows):        
-        feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)
-        # N -> W x H 484 -> MASK_W x MASK_H
+        feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)        
+        # N x T x 4(h) x 4(w) x F
         mask = torch.stack([
             torch.stack([
                 torch.stack([
-                    self.fcl(feat_rgb[:, t, w, h], feat_flow[:, t, w, h]) for t in range(feat_rgb.size(1))
+                    self.fcl(feat_rgb[:, t, h, w], feat_flow[:, t, h, 2]) for t in range(feat_rgb.size(1))
                 ])            
-            for w in range(feat_rgb.size(2))
+                for h in range(feat_rgb.size(2))
             ])
-            for h in range(feat_rgb.size(3))
+            for w in range(feat_rgb.size(3))
         ]).squeeze(4).permute(3, 2, 1, 0)
         mask = mask.unsqueeze(1)
         mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
