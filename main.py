@@ -9,9 +9,12 @@ import torch.nn.functional as F
 import numpy as np
 import torch.optim as optim
 from tqdm import tqdm
+import sys
+import argparse
 
 MASK_W = 4
 MASK_H = 4
+BATCH = 5
 
 class Loss(nn.Module):
     # calculate distance between two features
@@ -25,20 +28,20 @@ class Loss(nn.Module):
         return torch.mean(torch.clamp(torch.norm(feature0 - feature1, dim=1) - self.margin, min=0.0)) + reg
 
 class FCL(nn.Module):
-    def __init__(self, rgb_input_size, flow_input_size, output_size):
+    def __init__(self, rgb_input_size, flow_input_size):        
         super().__init__()
         # FC Layer
-        self.activation = nn.GELU()
+        self.activation = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
         self.layer1 = nn.Linear(rgb_input_size + flow_input_size, 256)
         self.layer2 = nn.Linear(256, 128)
-        self.layer3 = nn.Linear(128, output_size)
+        self.layer3 = nn.Linear(128, 1)
 
         self.dropout1 = nn.Dropout(0.6)
         self.dropout2 = nn.Dropout(0.6)
 
-    def forward(self, rgb_feature, flow_feature):
-        x = torch.cat([rgb_feature, flow_feature], dim=1)
+    def forward(self, feature_rgb, feature_flow):
+        x = torch.cat([feature_rgb, feature_flow], dim=1)
         x = self.dropout1(self.activation(self.layer1(x)))
         x = self.dropout2(self.activation(self.layer2(x)))
         return self.sigmoid(self.layer3(x))
@@ -46,19 +49,18 @@ class FCL(nn.Module):
 PATH_TRAINED_MODEL_RGB = "./pytorch_i3d/models/rgb_charades.pt"
 PATH_TRAINED_MODEL_FLOW = "./pytorch_i3d/models/flow_charades.pt"
 class MyModel(nn.Module):
-    def __init__(self):
-        super(MyModel, self).__init__()
-        ENDPOINT = "MaxPool3d_4a_3x3"        
+    def __init__(self, endpoint="MaxPool3d_2a_3x3"):
+        super(MyModel, self).__init__()  
         self.rgb_backbone = InceptionI3d(400, in_channels=3)
         self.rgb_backbone.replace_logits(157)
         self.rgb_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_RGB))
-        self.rgb_backbone._final_endpoint = ENDPOINT
+        self.rgb_backbone._final_endpoint = endpoint
         self.rgb_backbone.build()
         
         self.flow_backbone = InceptionI3d(400, in_channels=2)
         self.flow_backbone.replace_logits(157)
         self.flow_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_FLOW))
-        self.flow_backbone._final_endpoint = ENDPOINT
+        self.flow_backbone._final_endpoint = endpoint
         self.flow_backbone.build()
         
         self.feature_backbone = InceptionI3d(400, in_channels=3)
@@ -71,15 +73,18 @@ class MyModel(nn.Module):
         __freeze(self.rgb_backbone)
         __freeze(self.flow_backbone)
         __freeze(self.feature_backbone)
-                
-        # 4 x 4 x T
-        self.fcl = FCL(484, 484, MASK_W * MASK_H * 16)
+
+        feat_rgb, feat_flow = self.forward_twostream(torch.randn(BATCH, 3, 16, 224, 224), torch.randn(BATCH, 2, 16, 224, 224))
+        self.fcl = FCL(feat_rgb.size(4), feat_flow.size(4))
         
     def forward_twostream(self, rgbs, flows):
-        def _pooling_and_flatten(x):
-            return x.max(dim=1).values.max(dim=1).values.flatten(start_dim=1)
-        x_rgb = _pooling_and_flatten(self.rgb_backbone.extract_features(rgbs))
-        x_flow = _pooling_and_flatten(self.flow_backbone.extract_features(flows))
+        def _fold_and_flatten(x):
+            # TODO: これでいいのか？
+            # N x C x T x H x W => N x T x 4 x 4 x (C x H/4 x W/4)
+            s = x.size(3) // 4
+            return x.unfold(3, s, s).unfold(4, s, s).permute(0, 2, 3, 4, 1, 5, 6).flatten(4)
+        x_rgb = _fold_and_flatten(self.rgb_backbone.extract_features(rgbs))
+        x_flow = _fold_and_flatten(self.flow_backbone.extract_features(flows))
         return x_rgb, x_flow
     
     def _masking(self, rgbs, mask, img_background):
@@ -91,12 +96,20 @@ class MyModel(nn.Module):
         return masked_rgb + masked_background.permute(0, 2, 1, 3, 4)
         
     def get_mask(self, rgbs, flows):        
-        x_rgb, x_flow = self.forward_twostream(rgbs, flows)
+        feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)
         # N -> W x H 484 -> MASK_W x MASK_H
-        mask = self.fcl(x_rgb, x_flow)
-        mask = mask.view(-1, 16, MASK_W, MASK_H)
-        # resize mask
-        mask = F.interpolate(mask, size=(224, 224), mode="bilinear", align_corners=False).squeeze(1)
+        mask = torch.stack([
+            torch.stack([
+                torch.stack([
+                    self.fcl(feat_rgb[:, t, w, h], feat_flow[:, t, w, h]) for t in range(feat_rgb.size(1))
+                ])            
+            for w in range(feat_rgb.size(2))
+            ])
+            for h in range(feat_rgb.size(3))
+        ]).squeeze(4).permute(3, 2, 1, 0)
+        mask = mask.unsqueeze(1)
+        mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
+        mask = mask.squeeze(1)
         return mask
     
     def forward(self, rgbs, flows, img_background):
@@ -140,8 +153,7 @@ def open_flows(l_path):
     
 EPOCH = 100000
 EVALUTATION_INTERVAL = 1000
-def train(batch_rgbs, batch_flows, img_background, cuda=True):
-    model = MyModel()
+def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     model = model.cuda() if cuda else model
     
     batch_rgbs = batch_rgbs.cuda() if cuda else batch_rgbs
@@ -183,8 +195,20 @@ def train(batch_rgbs, batch_flows, img_background, cuda=True):
         masks = model.get_mask(batch_rgbs, batch_flows)
         yield model, masks
     
-
-if __name__ == "__main__":
+ENDPOINTS = [
+        'Conv3d_1a_7x7',
+        'MaxPool3d_2a_3x3',
+        'Conv3d_2b_1x1',
+        'Conv3d_2c_3x3',
+        'MaxPool3d_3a_3x3']
+if __name__ == "__main__":    
+    # endpoint from command line
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--endpoint", type=str, default="Conv3d_1a_7x7")
+    args = parser.parse_args()
+    endpoint = args.endpoint
+    print("endpoint:", endpoint)
+    
     l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
     l_mask_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/*.npy"))
     
@@ -192,12 +216,13 @@ if __name__ == "__main__":
     images_without_normalize, img_background_without_normalize = open_images_with_background(l_path, False)
     flows = open_flows(l_mask_path)
     
-    batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
-    batch_images_without_normalize = torch.vstack([images_without_normalize[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
-    batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(10)])
+    batch_rgbs = torch.vstack([images[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
+    batch_images_without_normalize = torch.vstack([images_without_normalize[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
+    batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(BATCH)])
     print("size: ", batch_rgbs.size(), batch_flows.size())
     
-    for model, masks in train(batch_rgbs, batch_flows, img_background):
+    model = MyModel(endpoint=endpoint)
+    for model, masks in train(model, batch_rgbs, batch_flows, img_background):
         model.eval()
         with torch.no_grad():
             model = model.cuda()
@@ -217,12 +242,12 @@ if __name__ == "__main__":
             # save images
             masks = masks[-1:].cpu().contiguous().view(-1, 224, 224).numpy()
             for i, mask in enumerate(masks):
-                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/masked{i:02}-mask.png")
+                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{endpoint}/masked{i:02}-mask.png")
                 
             for i, masked in enumerate(masked0):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/masked{i:02}-0.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{endpoint}/masked{i:02}-0.png")
             # save images
             for i, masked in enumerate(masked1):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/masked{i:02}-1.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{endpoint}/masked{i:02}-1.png")
         
         
