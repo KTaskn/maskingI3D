@@ -18,17 +18,18 @@ BATCH = 5
 
 class Loss(nn.Module):
     # calculate distance between two features
-    def __init__(self, margin=0.2, alpha=1.0):
+    def __init__(self, alpha=1.0, beta=1.0):
         super().__init__()
-        self.margin = margin
         self.alpha = alpha
+        self.beta = beta
         
-    def forward(self, feature0, feature1, mask):        
+    def forward(self, feature0, feature1, feature_bg, mask):        
         var = mask.var(dim=(2, 3)).mean(dim=1)
         reg = torch.exp(-var) * self.alpha
-        return torch.mean(torch.pow(
-                F.cosine_similarity(feature0, feature1), 2) + reg
-        ), var.mean()
+        f01 = torch.pow(F.cosine_similarity(feature0, feature1), 2)
+        f0bg = torch.pow(F.cosine_similarity(feature0, feature_bg), 2) * self.beta
+        f1bg = torch.pow(F.cosine_similarity(feature1, feature_bg), 2) * self.beta
+        return torch.mean(f01 + f0bg + f1bg + reg), var.mean()
 
 class FCL(nn.Module):
     def __init__(self, rgb_input_size, flow_input_size):        
@@ -127,7 +128,13 @@ class MyModel(nn.Module):
         # mask = N x T x H x W
         # masking rgb
         masked0, masked1 = self._masking(rgbs, mask, img_background), self._masking(rgbs, 1.0 - mask, img_background)
-        return self.feature_backbone(masked0).squeeze(2), self.feature_backbone(masked1).squeeze(2), mask
+        videos_background = img_background.unsqueeze(0).repeat(masked0.size(0), masked0.size(2), 1, 1, 1).permute(0, 2, 1, 3, 4)
+        return (
+            self.feature_backbone(masked0).squeeze(2),
+            self.feature_backbone(masked1).squeeze(2),
+            self.feature_backbone(videos_background).squeeze(2),
+            mask
+        )
 
 def open_images_with_background(l_path, normalize=True):   
     transform = transforms.Compose([
@@ -184,10 +191,9 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=10.0)
                     yield num_step, model, masks
             model.train()
             idx = np.random.randint(0, batch_rgbs.size(0) - BATCH)
-            feature0, feature1, masks = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
-            # feature0, feature1, masks = model(batch_rgbs, batch_flows, img_background)
+            feature0, feature1, feature_bg, masks = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
                     
-            loss, var = criterion(feature0, feature1, masks)
+            loss, var = criterion(feature0, feature1, feature_bg, masks)
         
             optimizer.zero_grad()
             loss.backward()
