@@ -24,8 +24,11 @@ class Loss(nn.Module):
         self.alpha = alpha
         
     def forward(self, feature0, feature1, mask):
-        reg = torch.exp(-mask.var()) * self.alpha
-        return torch.mean(torch.clamp(torch.norm(feature0 - feature1, dim=1) - self.margin, min=0.0)) + reg
+        var = mask.var(dim=(2, 3)).mean(dim=1)
+        reg = torch.exp(-var) * self.alpha
+        return torch.mean(
+            torch.clamp(torch.norm(feature0 - feature1, dim=1) - self.margin, min=0.0) + reg
+        ), var.mean()
 
 class FCL(nn.Module):
     def __init__(self, rgb_input_size, flow_input_size):        
@@ -159,7 +162,7 @@ def open_flows(l_path):
     
 EPOCH = 10000
 EVALUTATION_INTERVAL = 1000
-def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
+def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=10.0):
     model = model.cuda() if cuda else model
     
     batch_rgbs = batch_rgbs.cuda() if cuda else batch_rgbs
@@ -167,7 +170,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
     img_background = img_background.cuda() if cuda else img_background
     
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    criterion = Loss()
+    criterion = Loss(alpha=alpha)
 
     loss_sum = 0
     total = 0
@@ -184,7 +187,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
             feature0, feature1, masks = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
             # feature0, feature1, masks = model(batch_rgbs, batch_flows, img_background)
                     
-            loss = criterion(feature0, feature1, masks)
+            loss, var = criterion(feature0, feature1, masks)
         
             optimizer.zero_grad()
             loss.backward()
@@ -195,7 +198,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True):
             running_loss = loss_sum / total
 
             pbar.set_postfix({
-                "exp(-mask_var)": torch.exp(-masks.var()).item(),
+                "mask_var": var.item(),
                 "running_loss": running_loss,
             })
             pbar.update(1)
@@ -210,14 +213,21 @@ ENDPOINTS = [
         'MaxPool3d_2a_3x3',
         'Conv3d_2b_1x1',
         'Conv3d_2c_3x3',
-        'MaxPool3d_3a_3x3']
+        'MaxPool3d_3a_3x3',
+        'Mixed_3b',
+        'Mixed_3c']
 if __name__ == "__main__":    
     # endpoint from command line
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", type=str, default="MaxPool3d_2a_3x3")
+    parser.add_argument("--endpoint", type=str, default="Conv3d_2c_3x3")
+    parser.add_argument("--alpha", type=float, default=10.0)
     args = parser.parse_args()
     endpoint = args.endpoint
+    alpha = args.alpha
+    dirname = f"{endpoint}_{alpha:.1f}"
     print("endpoint:", endpoint)
+    print("alpha:", alpha)
+    print("dirname:", dirname)
     
     l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
     l_flow_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/*.npy"))
@@ -234,9 +244,9 @@ if __name__ == "__main__":
     print("size: ", batch_rgbs.size(), batch_flows.size())
     
     model = MyModel(endpoint=endpoint)
-    for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background):
+    for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background, alpha=alpha):
         model.eval()
-        torch.save(model.state_dict(), f"./masked/{endpoint}/model{num_step:08}.pt")
+        torch.save(model.state_dict(), f"./masked/{dirname}/model{num_step:08}.pt")
         with torch.no_grad():
             model = model.cuda()
             masks = masks.cuda()
@@ -255,12 +265,12 @@ if __name__ == "__main__":
             # save images
             masks = masks[:].cpu().contiguous().view(-1, 224, 224).numpy()
             for i, mask in enumerate(masks):
-                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{endpoint}/masked{i:02}-mask.png")
+                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{dirname}/masked{i:02}-mask.png")
                 
             for i, masked in enumerate(masked0):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{endpoint}/masked{i:02}-0.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/masked{i:02}-0.png")
             # save images
             for i, masked in enumerate(masked1):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{endpoint}/masked{i:02}-1.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/masked{i:02}-1.png")
         
         
