@@ -1,5 +1,24 @@
 import torch
-from main import MyModel
+from main import MyModel, Loss
+
+
+def test_loss():
+    criterion = Loss(alpha=0.0)
+    N = 5
+    mask = torch.zeros(N, 16, 224, 224)
+    x1 = torch.randn(N, 100)
+    x2 = torch.randn(N, 100)
+    with torch.no_grad():
+        loss, var = criterion(x1, x1, mask)
+    assert loss.item() == 1.0
+    
+    with torch.no_grad():
+        loss, var = criterion(x1, -x1, mask)
+    assert loss.item() == 1.0
+    
+    with torch.no_grad():
+        loss, var = criterion(x1, x2, mask)
+    assert loss.item() >= 0.0
 
 def test__fold_mask():
     H, W, T = 224, 224, 16

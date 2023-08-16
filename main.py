@@ -18,16 +18,16 @@ BATCH = 5
 
 class Loss(nn.Module):
     # calculate distance between two features
-    def __init__(self, margin=0.2, alpha=70.0):
+    def __init__(self, margin=0.2, alpha=1.0):
         super().__init__()
         self.margin = margin
         self.alpha = alpha
         
-    def forward(self, feature0, feature1, mask):
+    def forward(self, feature0, feature1, mask):        
         var = mask.var(dim=(2, 3)).mean(dim=1)
         reg = torch.exp(-var) * self.alpha
-        return torch.mean(
-            torch.clamp(torch.norm(feature0 - feature1, dim=1) - self.margin, min=0.0) + reg
+        return torch.mean(torch.pow(
+                F.cosine_similarity(feature0, feature1), 2) + reg
         ), var.mean()
 
 class FCL(nn.Module):
@@ -220,7 +220,7 @@ if __name__ == "__main__":
     # endpoint from command line
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", type=str, default="Conv3d_2c_3x3")
-    parser.add_argument("--alpha", type=float, default=10.0)
+    parser.add_argument("--alpha", type=float, default=1.0)
     args = parser.parse_args()
     endpoint = args.endpoint
     alpha = args.alpha
