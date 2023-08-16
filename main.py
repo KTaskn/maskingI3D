@@ -169,7 +169,7 @@ def open_flows(l_path):
     
 EPOCH = 10000
 EVALUTATION_INTERVAL = 1000
-def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=10.0):
+def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, beta=1.0):
     model = model.cuda() if cuda else model
     
     batch_rgbs = batch_rgbs.cuda() if cuda else batch_rgbs
@@ -177,7 +177,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=10.0)
     img_background = img_background.cuda() if cuda else img_background
     
     optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    criterion = Loss(alpha=alpha)
+    criterion = Loss(alpha=alpha, beta=beta)
 
     loss_sum = 0
     total = 0
@@ -227,12 +227,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", type=str, default="Conv3d_2c_3x3")
     parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=1.0)
     args = parser.parse_args()
     endpoint = args.endpoint
     alpha = args.alpha
-    dirname = f"{endpoint}_{alpha:.1f}"
+    beta = args.beta
+    dirname = f"{endpoint}_{alpha:.1f}_{beta:.1f}"
     print("endpoint:", endpoint)
     print("alpha:", alpha)
+    print("beta:", beta)
     print("dirname:", dirname)
     
     l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
@@ -250,7 +253,7 @@ if __name__ == "__main__":
     print("size: ", batch_rgbs.size(), batch_flows.size())
     
     model = MyModel(endpoint=endpoint)
-    for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background, alpha=alpha):
+    for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background, alpha=alpha, beta=beta):
         model.eval()
         torch.save(model.state_dict(), f"./masked/{dirname}/model{num_step:08}.pt")
         with torch.no_grad():
