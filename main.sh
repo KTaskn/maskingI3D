@@ -18,7 +18,7 @@ do
             if [ ! -d "./masked/$dirname" ]; then
                 mkdir -p ./masked/$dirname
             fi
-            python main.py --endpoint $endpoint --alpha $alpha
+            python main.py --endpoint $endpoint --alpha $alpha --beta $beta
         done
     done
 done

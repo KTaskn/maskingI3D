@@ -23,8 +23,8 @@ class Loss(nn.Module):
         self.alpha = alpha
         self.beta = beta
         
-    def forward(self, feature0, feature1, feature_bg, mask):        
-        var = mask.var(dim=(2, 3)).mean(dim=1)
+    def forward(self, feature0, feature1, feature_bg, switch):        
+        var = switch.var(dim=2).mean(dim=1)
         reg = torch.exp(-var) * self.alpha
         f01 = torch.pow(F.cosine_similarity(feature0, feature1), 2)
         f0bg = torch.pow(F.cosine_similarity(feature0, feature_bg), 2) * self.beta
@@ -40,7 +40,7 @@ class FCL(nn.Module):
         self.sigmoid = nn.Sigmoid()
         self.layer1 = nn.Linear(rgb_input_size + flow_input_size, 1024)
         self.layer2 = nn.Linear(1024, 256)
-        self.layer3 = nn.Linear(256, 1)
+        self.layer3 = nn.Linear(256, 12)
         self.dropout1 = nn.Dropout(0.6)
         self.dropout2 = nn.Dropout(0.6)
 
@@ -53,6 +53,10 @@ class FCL(nn.Module):
 PATH_TRAINED_MODEL_RGB = "./pytorch_i3d/models/rgb_imagenet.pt"
 PATH_TRAINED_MODEL_FLOW = "./pytorch_i3d/models/flow_imagenet.pt"
 class MyModel(nn.Module):
+    
+    def xy(self, radian: torch.Tensor):
+        return torch.stack([torch.cos(radian), torch.sin(radian)], dim=-1)
+        
     def __init__(self, endpoint="MaxPool3d_2a_3x3"):
         super(MyModel, self).__init__()  
         self.rgb_backbone = InceptionI3d(in_channels=3)
@@ -76,16 +80,19 @@ class MyModel(nn.Module):
         __freeze(self.feature_backbone)
 
         feat_rgb, feat_flow = self.forward_twostream(torch.randn(BATCH, 3, 16, 224, 224), torch.randn(BATCH, 2, 16, 224, 224))
-        self.fcl = FCL(feat_rgb.size(4), feat_flow.size(4))
+        self.fcl = FCL(feat_rgb.size(2), feat_flow.size(2))
+        
+        self.directions = self.xy(
+            torch.tensor([0.0, 1/6, 2/6, 3/6, 4/6, 5/6, 1.0, 7/6, 8/6, 9/6, 10/6, 11/6]) * torch.pi
+        ).cuda()
         
     def _fold_and_flatten(self, x):
-        # TODO: これでいいのか？ -> 全体の数が減るぽい(はみ出る分を捨てる)
-        # N x C x T x H x W => N x T x 4 x 4 x (C x H/4 x W/4)
-        s = x.size(3) // 4
-        return x.unfold(3, s, s).unfold(4, s, s).permute(0, 2, 3, 4, 1, 5, 6).flatten(4)
+        # flatten
+        # N x C x T x H x W => N x T x (C x H x W)
+        return x.permute(0, 2, 1, 3, 4).flatten(2)
     
     def forward_twostream(self, rgbs, flows):
-        # N x T x 4(h) x 4(w) x F
+        # N x T x (C x H x W)
         x_rgb = self._fold_and_flatten(self.rgb_backbone.extract_features(rgbs))
         x_flow = self._fold_and_flatten(self.flow_backbone.extract_features(flows))
         return x_rgb, x_flow
@@ -105,25 +112,26 @@ class MyModel(nn.Module):
         mask = F.interpolate(mask, size=(16, 224, 224), mode="trilinear", align_corners=False)
         mask = mask.squeeze(1)
         # ret = N x T x H x W
-        return mask
-    
+        return mask        
+
     def get_mask(self, rgbs, flows):        
-        feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)        
-        # N x T x 4(h) x 4(w) x F
-        # mask = H x W x T x 10 x 1
-        mask = torch.stack([
-            torch.stack([
-                torch.stack([
-                    self.fcl(feat_rgb[:, t, h, w], feat_flow[:, t, h, w]) for t in range(feat_rgb.size(1))
-                ])            
-                for w in range(feat_rgb.size(3))
-            ])
-            for h in range(feat_rgb.size(2))
-        ])
-        return self._fold_mask(mask)
+        feat_rgb, feat_flow = self.forward_twostream(rgbs, flows)
+        # in: N x T x (C x H x W)
+        # switch: N x T x 12 => N x 12 x T
+        switch = torch.stack(
+            [self.fcl(feat_rgb[b], feat_flow[b]) for b in range(feat_rgb.size(0))]
+        ).permute(0, 2, 1)
+        # switch: N x 12 x T => N x 16 x 12
+        switch = F.interpolate(switch, size=16, mode="linear", align_corners=False).permute(0, 2, 1)
+        # masks: N x T x H x W x 12
+        masks = torch.clamp(torch.einsum("bcthw,zc->bthwz", flows, self.directions), min=0.0)
+        
+        # mask: N x T x H x W
+        mask = torch.einsum("bthwz,btz->bthw", masks, switch)        
+        return mask, switch
     
     def forward(self, rgbs, flows, img_background):
-        mask = self.get_mask(rgbs, flows)
+        mask, switch = self.get_mask(rgbs, flows)
         # rgbs = N x C x T x H x W
         # mask = N x T x H x W
         # masking rgb
@@ -133,7 +141,8 @@ class MyModel(nn.Module):
             self.feature_backbone(masked0).squeeze(2),
             self.feature_backbone(masked1).squeeze(2),
             self.feature_backbone(videos_background).squeeze(2),
-            mask
+            mask,
+            switch
         )
 
 def open_images_with_background(l_path, normalize=True):   
@@ -187,13 +196,13 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, 
             if num_step % EVALUTATION_INTERVAL == 0:
                 model.eval()
                 with torch.no_grad():
-                    masks = model.get_mask(batch_rgbs, batch_flows)
+                    masks, switch = model.get_mask(batch_rgbs, batch_flows)
                     yield num_step, model, masks
             model.train()
             idx = np.random.randint(0, batch_rgbs.size(0) - BATCH)
-            feature0, feature1, feature_bg, masks = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
+            feature0, feature1, feature_bg, masks, switch = model(batch_rgbs[idx:idx+BATCH], batch_flows[idx:idx+BATCH], img_background)
                     
-            loss, var = criterion(feature0, feature1, feature_bg, masks)
+            loss, var = criterion(feature0, feature1, feature_bg, switch)
         
             optimizer.zero_grad()
             loss.backward()
@@ -211,7 +220,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, 
             
     model.eval()
     with torch.no_grad():
-        masks = model.get_mask(batch_rgbs, batch_flows)
+        masks, switch = model.get_mask(batch_rgbs, batch_flows)
         yield num_step, model, masks
     
 ENDPOINTS = [
@@ -225,7 +234,7 @@ ENDPOINTS = [
 if __name__ == "__main__":    
     # endpoint from command line
     parser = argparse.ArgumentParser()
-    parser.add_argument("--endpoint", type=str, default="Conv3d_2c_3x3")
+    parser.add_argument("--endpoint", type=str, default="MaxPool3d_3a_3x3")
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=1.0)
     args = parser.parse_args()
