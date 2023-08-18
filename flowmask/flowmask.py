@@ -4,6 +4,7 @@ import torch
 from main import open_flows
 import numpy as np
 import cv2
+import torch.nn.functional as F
 
 def xy(radian: torch.Tensor):
     return torch.stack([torch.cos(radian), torch.sin(radian)], dim=-1)
@@ -23,15 +24,17 @@ if __name__ == "__main__":
     # B x C
     xy = xy(rad)
     l_path = [
-        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/001.npy",
-        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/002.npy",
-        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/003.npy",
+        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/130.npy",
+        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/131.npy",
+        "../datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/132.npy",
         ]
     # B x T x H x W x C
     flow = open_flows(l_path).permute(0, 2, 3, 4, 1)
-    print(flow.size())
-    
     cv2.imwrite("./flow.png", flow2rgb(flow[0, 0].numpy(), flow[0, 0].numpy()))
+    print(flow.size())
+    flow = torch.stack([F.avg_pool2d(flow[idx].permute(0, 3, 1, 2), 5, 1, 2).permute(0, 2, 3, 1) for idx in range(flow.size(0))])
+    print(flow.size())
+    cv2.imwrite("./flow_stride.png", flow2rgb(flow[0, 0].numpy(), flow[0, 0].numpy()))
         
     # 12方向ごとに分ける
     masks = torch.clamp(torch.einsum("bthwc,zc->bthwz", flow, xy), min=0.0)
@@ -43,12 +46,5 @@ if __name__ == "__main__":
     switch = torch.ones(1, masks.size(1), 12)    
     
     # 12方向ごとに分けたものを足し合わせる
-    # mask = torch.stack([
-    #     torch.stack([torch.sum(
-    #         torch.stack([masks[n, t, :, :, c] * switch[n, t, c] for c in range(switch.size(2))]),
-    #         dim=0
-    #     ) for t in range(masks.size(1))])
-    #     for n in range(masks.size(0))
-    # ])    
     mask = torch.einsum("bthwz,btz->bthw", masks, switch)
     cv2.imwrite("./mask.png", 255 * mask[0, 0].numpy())

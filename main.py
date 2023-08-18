@@ -57,7 +57,7 @@ class MyModel(nn.Module):
     def xy(self, radian: torch.Tensor):
         return torch.stack([torch.cos(radian), torch.sin(radian)], dim=-1)
         
-    def __init__(self, endpoint="MaxPool3d_2a_3x3"):
+    def __init__(self, endpoint="MaxPool3d_2a_3x3", avgpool_kernel_size=9):
         super(MyModel, self).__init__()  
         self.rgb_backbone = InceptionI3d(in_channels=3)
         self.rgb_backbone.load_state_dict(torch.load(PATH_TRAINED_MODEL_RGB))
@@ -85,6 +85,8 @@ class MyModel(nn.Module):
         self.directions = self.xy(
             torch.tensor([0.0, 1/6, 2/6, 3/6, 4/6, 5/6, 1.0, 7/6, 8/6, 9/6, 10/6, 11/6]) * torch.pi
         ).cuda()
+        
+        self.avgpool_kernel_size = avgpool_kernel_size
         
     def _fold_and_flatten(self, x):
         # flatten
@@ -124,10 +126,20 @@ class MyModel(nn.Module):
         # switch: N x 12 x T => N x 16 x 12
         switch = F.interpolate(switch, size=16, mode="linear", align_corners=False).permute(0, 2, 1)
         # masks: N x T x H x W x 12
-        masks = torch.clamp(torch.einsum("bcthw,zc->bthwz", flows, self.directions), min=0.0)
+        flows_avgpool = torch.stack([
+            F.avg_pool2d(
+                    flows[idx].permute(0, 3, 1, 2),
+                    self.avgpool_kernel_size,
+                    1,
+                    self.avgpool_kernel_size // 2
+                ).permute(0, 2, 3, 1)
+                for idx in range(flows.size(0))
+            ])
+        masks = torch.clamp(torch.einsum("bcthw,zc->bthwz", flows_avgpool, self.directions), min=0.0)
         
         # mask: N x T x H x W
-        mask = torch.einsum("bthwz,btz->bthw", masks, switch)        
+        mask = torch.einsum("bthwz,btz->bthw", masks, switch)
+        mask = torch.where(mask < 0.5, torch.zeros_like(mask), torch.ones_like(mask))
         return mask, switch
     
     def forward(self, rgbs, flows, img_background):
@@ -178,6 +190,7 @@ def open_flows(l_path):
     
 EPOCH = 10000
 EVALUTATION_INTERVAL = 1000
+PRINT_INTERVAL = 100
 def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, beta=1.0):
     model = model.cuda() if cuda else model
     
@@ -212,11 +225,12 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, 
             total += feature0.size(0)
             running_loss = loss_sum / total
 
-            pbar.set_postfix({
-                "mask_var": var.item(),
-                "running_loss": running_loss,
-            })
-            pbar.update(1)
+            if num_step % PRINT_INTERVAL == 0:
+                pbar.set_postfix({
+                    "mask_var": var.item(),
+                    "running_loss": running_loss,
+                })
+                pbar.update(PRINT_INTERVAL)
             
     model.eval()
     with torch.no_grad():
@@ -235,16 +249,19 @@ if __name__ == "__main__":
     # endpoint from command line
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", type=str, default="MaxPool3d_3a_3x3")
-    parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--alpha", type=float, default=0.0)
+    parser.add_argument("--beta", type=float, default=0.0)
+    parser.add_argument("--avgpool_kernel_size", type=int, default=9)
     args = parser.parse_args()
     endpoint = args.endpoint
     alpha = args.alpha
     beta = args.beta
-    dirname = f"{endpoint}_{alpha:.1f}_{beta:.1f}"
+    avgpool_kernel_size = args.avgpool_kernel_size
+    dirname = f"{endpoint}_{alpha:.1f}_{beta:.1f}_{avgpool_kernel_size}"
     print("endpoint:", endpoint)
     print("alpha:", alpha)
     print("beta:", beta)
+    print("avgpool_kernel_size:", avgpool_kernel_size)
     print("dirname:", dirname)
     
     l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
@@ -261,10 +278,10 @@ if __name__ == "__main__":
     batch_flows = torch.vstack([flows[:, :, seq * 16:seq * 16 + 16] for seq in range(images.size(2) // 16)])
     print("size: ", batch_rgbs.size(), batch_flows.size())
     
-    model = MyModel(endpoint=endpoint)
+    model = MyModel(endpoint=endpoint, avgpool_kernel_size=avgpool_kernel_size)
     for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background, alpha=alpha, beta=beta):
         model.eval()
-        torch.save(model.state_dict(), f"./masked/{dirname}/model{num_step:08}.pt")
+        torch.save(model.state_dict(), f"./masked/{dirname}/{num_step:05}/model.pt")
         with torch.no_grad():
             model = model.cuda()
             masks = masks.cuda()
@@ -283,12 +300,12 @@ if __name__ == "__main__":
             # save images
             masks = masks[:].cpu().contiguous().view(-1, 224, 224).numpy()
             for i, mask in enumerate(masks):
-                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{dirname}/masked{i:02}-mask.png")
+                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-mask.png")
                 
             for i, masked in enumerate(masked0):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/masked{i:02}-0.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-0.png")
             # save images
             for i, masked in enumerate(masked1):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/masked{i:02}-1.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-1.png")
         
         
