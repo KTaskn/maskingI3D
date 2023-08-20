@@ -1,5 +1,5 @@
-dir=/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test
-outdir=./UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test
+dir=/datasets/ucf-crime/jpgs/Anomaly
+outdir=/outputs/ucf-crime/jpgs/Anomaly
 
 for subdir in $dir/*
 do

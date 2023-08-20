@@ -8,3 +8,4 @@ datpytorch_i3d/asets/**/*
 *.txt
 *.pt
 *.mp4
+!requirements.txt
