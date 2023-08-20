@@ -205,7 +205,7 @@ def train(model, batch_rgbs, batch_flows, img_background, cuda=True, alpha=1.0, 
     total = 0
         
     with tqdm(total=EPOCH, unit="batch") as pbar:
-        for num_step in range(EPOCH):
+        for num_step in range(EPOCH + 1):
             if num_step % EVALUTATION_INTERVAL == 0:
                 model.eval()
                 with torch.no_grad():
@@ -248,24 +248,31 @@ ENDPOINTS = [
 if __name__ == "__main__":    
     # endpoint from command line
     parser = argparse.ArgumentParser()
+    # パラメータは実験で定性的なベスト
     parser.add_argument("--endpoint", type=str, default="MaxPool3d_3a_3x3")
     parser.add_argument("--alpha", type=float, default=0.0)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--avgpool_kernel_size", type=int, default=9)
+    parser.add_argument("--casename", type=str, default="Test024")
+    parser.add_argument("--output", type=str, default="masked")
     args = parser.parse_args()
     endpoint = args.endpoint
     alpha = args.alpha
     beta = args.beta
     avgpool_kernel_size = args.avgpool_kernel_size
-    dirname = f"{endpoint}_{alpha:.1f}_{beta:.1f}_{avgpool_kernel_size}"
+    casename = args.casename
+    output = args.output
+    
+    dirname = f"./{output}/{casename}_{endpoint}_{alpha:.1f}_{beta:.1f}_{avgpool_kernel_size}"
     print("endpoint:", endpoint)
     print("alpha:", alpha)
     print("beta:", beta)
     print("avgpool_kernel_size:", avgpool_kernel_size)
+    print("casename:", casename)
     print("dirname:", dirname)
     
-    l_path = sorted(glob("/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/*.tif"))
-    l_flow_path = sorted(glob("./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/Test024/flows/*.npy"))
+    l_path = sorted(glob(f"/datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/{casename}/*.tif"))
+    l_flow_path = sorted(glob(f"./datasets/UCSD_Anomaly_Dataset_v1p2/UCSDped1/Test/{casename}/flows/*.npy"))
     
     images, img_background = open_images_with_background(l_path, True)
     images_without_normalize, img_background_without_normalize = open_images_with_background(l_path, False)
@@ -281,7 +288,9 @@ if __name__ == "__main__":
     model = MyModel(endpoint=endpoint, avgpool_kernel_size=avgpool_kernel_size)
     for num_step, model, masks in train(model, batch_rgbs, batch_flows, img_background, alpha=alpha, beta=beta):
         model.eval()
-        torch.save(model.state_dict(), f"./masked/{dirname}/{num_step:05}/model.pt")
+        if num_step == EPOCH:
+            torch.save(model.state_dict(), f"{dirname}/{num_step:05}/model.pt")
+            
         with torch.no_grad():
             model = model.cuda()
             masks = masks.cuda()
@@ -300,12 +309,12 @@ if __name__ == "__main__":
             # save images
             masks = masks[:].cpu().contiguous().view(-1, 224, 224).numpy()
             for i, mask in enumerate(masks):
-                Image.fromarray((mask * 255).astype(np.uint8)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-mask.png")
+                Image.fromarray((mask * 255).astype(np.uint8)).save(f"{dirname}/{num_step:05}/masked{i:02}-mask.png")
                 
             for i, masked in enumerate(masked0):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-0.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"{dirname}/{num_step:05}/masked{i:02}-0.png")
             # save images
             for i, masked in enumerate(masked1):
-                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"./masked/{dirname}/{num_step:05}/masked{i:02}-1.png")
+                Image.fromarray((masked * 255).astype(np.uint8).transpose(1, 2, 0)).save(f"{dirname}/{num_step:05}/masked{i:02}-1.png")
         
         
